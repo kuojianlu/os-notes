@@ -483,7 +483,7 @@ int fchmodat(int fd, const char *pathname, mode_t mode, int flag);
 - vfork函数的调用序列和返回值与fork相同，但两者语义不同
 - vfork用于创建一个新进程，而该进程的目的是exec一个新程序
 - vfork与fork一样都创建一个子进程，但是它不将父进程的地址空间完全复制到子进程中，因为子进程会立即调用exec（或exit），于是也就不会引用该地址空间。不过在子进程调用exec或exit之前，它在父进程的空间中运行。这种优化方式在某些Unix系统的实现中提高了效率，但如果子进程修改数据、进行函数调用、或者没有调用exec或exit就返回都可能会带来未知的结果（实现采用写时复制技术以提高fork之后跟随exec的效率，但是不复制比部分复制还是要快一些）
-- vfork与fork之间的另一个区别是：vfork保证子进程显运行，在它调用exec或exit之后父进程才可能被调度运行（如果在调用这两个函数之前子进程依赖父进程的进一步动作，则会导致死锁）
+- vfork与fork之间的另一个区别是：vfork保证子进程先运行，在它调用exec或exit之后父进程才可能被调度运行（如果在调用这两个函数之前子进程依赖父进程的进一步动作，则会导致死锁）
 
 ### 8.5 函数exit
 
@@ -653,3 +653,102 @@ int fchmodat(int fd, const char *pathname, mode_t mode, int flag);
 
 - 除了用来实现sleep函数外，alarm还常用于对可能阻塞的操作设置时间上限值。例如，程序中有一个读低速设备的可能阻塞的操作，我们希望超过一定时间量后就停止执行该操作
 
+## 第14章 高级IO
+
+### 14.2 非阻塞IO
+
+- 对于一个给定的描述符，有两种为其指定非阻塞IO的方法
+  - 如果调用open获得描述符，则可指定O_NONBLOCK标志
+  - 对于一个已经打开的描述符，则可调用fcntl，由该函数打开O_NONBLOCK文件状态标志
+
+### 14.3 记录锁
+
+- 记录锁的功能是，当第一个进程正在读或修改文件的某个部分时，使用记录锁可以阻止其他进程修改同一个文件区域。更准确的名字可能应该是字节范围锁
+
+- POSIX.1的fcntl记录锁
+
+  - `fcntl(nit fd, int cmd, .../* struct flock *flockptr */)`
+
+  - 对于记录锁，cmd是F_GETLK、F_SETLK或F_SETLKW，第三个参数是一个指向flock结构的指针，flock结构如下所示
+
+    ```c
+    struct flock {
+      short l_type; // F_RDLCK, F_WRLCK, F_UNLCK
+      short l_whence; // SEEK_SET, SEEK_CUR, SEEK_END
+      off_t l_start;
+      off_t l_len;
+      pid_t pid; // returned with F_GETLK
+    };
+    ```
+
+- 关于记录锁的自动继承和释放有3条规则
+  - 锁与进程和文件两者相关联
+    - 当一个进程终止时，它所建立的锁全部释放
+    - 无论一个描述符何时关闭，该进程通过这一描述符引用的文件上的任何一把锁都会释放
+  - 由fork产生的子进程不继承父进程所设置的锁。对于通过fork从父进程处继承过来的描述符，子进程需要调用fcntl才能获得它自己的锁
+  - 在执行exec后，新程序可以继承原执行程序的锁。但是注意，如果对一个文件描述符设了执行时关闭标志，那么当作为exec的一部分关闭该文件描述符时，将释放相应文件的所有锁
+
+- FreeBSD实现
+
+  - 关于记录锁的FreeBSD数据结构图如下
+
+    <img src="images/关于记录锁的FreeBSD数据结构.png" alt="image-20200108154308477" style="zoom:50%;" />
+
+### 14.4 IO多路复用
+
+#### 14.4.1 select和pselect
+
+- `int select(int maxfdpl, fd_set *restrict readfds, fd_set *restrict writefds, fd_set *restrict exceptfds, struct timeval *restrict tvptr)`
+  - `tvptr == NULL`
+    - 永远等待，如果捕捉到一个信号则中断此无限期等待。当所指定的描述符中的一个已准备好或捕捉到一个信号则返回。如果捕捉到一个信号，则select返回-1，errno设置为EINTR
+  - `tvptr->tv_sec == 0 && tvptr->tv_usec == 0`
+    - 不等待。测试所有指定的描述符并立即返回。这是轮询系统找到多个描述符状态而不阻塞select函数的方法
+  - `readfds, writefds, exceptfds`
+    - 这3个描述符集说明了我们关心的可读、可写或处于异常条件的描述符集
+    - 每个描述符集存储在一个fd_set的数据类型中。这个数据类型是由实现选择的，它可以为每一个可能的描述符保持一位
+    - 这3个描述符集中的任意一个（或全部）可以是空指针，这表示对相应条件并不关心。如果所有3个指针都是NULL，则select提供了比sleep更精确的定时器
+  - maxfdpl的意思是最大文件描述符编号值加1。这个参数实际上是要检查的描述符数（从描述符0开始）
+  - select有3个可能的返回值
+    - 返回值-1表示出错。例如，在所指定的描述符一个都没准备好时捕捉到一个信号。在这种情况下，一个描述符集都不修改
+    - 返回值0表示没有描述符准备好
+    - 一个正返回值说明了已经准备好的描述符数。该值是3个描述符集中已准备好的描述符数之和，所以如果同一描述符已准备好读和写，那么在返回值中会对其计两次数
+  - 对于“准备好”含义的具体说明
+    - 若对readfds中的一个描述符进行的read操作不会阻塞，则认为此描述符是准备好的
+    - 若对writefds中的一个描述符进行的write操作不会阻塞，则认为此描述符是准备好的
+    - 若对exceptfds中的一个描述符有一个未决异常条件，则认为此描述符是准备好的。现在，异常条件包括：在网络连接上到达带外的数据，或者在处于数据包模式的伪终端上发生了某些条件。普通文件的文件描述符总是返回准备好
+  - 一个描述符阻塞与否并不影响select是否阻塞，理解这一点很重要。也就是说，如果希望读一个非阻塞描述符，并且以超时值为5秒调用select，则select最多阻塞5秒。相类似，如果指定一个无限的超时值，则在该描述符数据准备好，或捕捉到一个信号之前，select会一直阻塞
+  - 如果在一个描述符上碰到了文件尾端，则select会认为该描述符是可读的。然后调用read，它会返回0，这是Unix提示到达文件尾端的方法
+
+- `int pselect(int maxfdpl, fd_set *restrict readfds, fd_set *restrict writefds, fd_set *restrict exceptfds, const struct timespec *restrict tsptr, const sigset_t *restrict sigmask)`
+  - pselect可使用可选信号屏幕字。若sigmask不为NULL，在调用pselect时，以原子操作的方式安装该信号屏幕字。在返回时，恢复以前的信号屏蔽字
+
+#### 14.4.2 poll
+
+- `int poll(struct pollfd fdarrray[], nfds_t nfds, int timeout)`
+
+  - pollfd结构如下
+
+    ```c
+    struct pollfd {
+      int fd;
+      short events; // events of interest on fd
+      short revents; // events that occurred on fd
+    };
+    ```
+
+  - events和revents标志
+
+    ![image-20200108230756659](images/poll的events和revents标志.png)
+
+    - 前4行测试的是可读性，接下来的3行测试的是可写性，最后3行测试的是异常条件。最后3行是由内核在返回时设置的，即使在events字段中没有指定这3个值，如果相应条件发生，在revents中也会返回它们
+    - 当一个描述符被挂断（POLLHUP）后，就不能再写描述符，但是有可能仍然可以从该描述符读取到数据
+
+  - timeout的取值
+
+    - 为-1时：永远等待
+    - 为0时：不等待
+    - 大于0时：等待最多timeout毫秒
+
+  - 理解文件尾端与挂断之间的区别是很重要的。如果我们正从终端输入数据，并键入文件结束符，那么就会打开POLLIN，于是我们就可以读文件结束指示（read返回0）。revents中的POLLHUP不会打开。但如果正在读调制解调器，并且电话线已挂断，我们将接到POLLHUP通知
+
+### 14.5 异步IO
